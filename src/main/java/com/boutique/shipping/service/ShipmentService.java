@@ -1,13 +1,2 @@
-package com.boutique.shipping.service;
-import com.boutique.shipping.entity.Shipment;
-import com.boutique.shipping.repository.ShipmentRepository;
-import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
-import java.util.UUID;
-@Service
-public class ShipmentService {
- private final ShipmentRepository repo;
- public ShipmentService(ShipmentRepository repo){this.repo=repo;}
- @Transactional public Shipment create(UUID orderId){return repo.findByOrderId(orderId).orElseGet(()->repo.save(new Shipment(orderId)));}
- @Transactional(readOnly=true) public Shipment get(UUID id){return repo.findById(id).orElseThrow();}
-}
+package com.boutique.shipping.service;import com.boutique.shipping.entity.Shipment;import com.boutique.shipping.messaging.ShipmentEventPublisher;import com.boutique.shipping.repository.*;import org.springframework.dao.DataIntegrityViolationException;import org.springframework.stereotype.Service;import org.springframework.transaction.annotation.Transactional;import java.util.UUID;
+@Service public class ShipmentService{private final ShipmentRepository repo;private final ShippingInboxRepository inbox;private final ShipmentEventPublisher events;public ShipmentService(ShipmentRepository r,ShippingInboxRepository i,ShipmentEventPublisher e){repo=r;inbox=i;events=e;}@Transactional public void processConfirmedEvent(UUID eventId,UUID orderId){if(inbox.claim(eventId)==0)return;create(orderId);}@Transactional public Shipment create(UUID orderId){return repo.findByOrderId(orderId).orElseGet(()->saveIdempotently(orderId));}private Shipment saveIdempotently(UUID orderId){try{Shipment s=repo.saveAndFlush(new Shipment(orderId));events.created(s.getId(),s.getOrderId());return s;}catch(DataIntegrityViolationException e){return repo.findByOrderId(orderId).orElseThrow(()->e);}}@Transactional(readOnly=true)public Shipment get(UUID id){return repo.findById(id).orElseThrow();}}

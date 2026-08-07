@@ -13,3 +13,9 @@ management:
   endpoints:
     web:
       exposure: {include: health,info}
+
+spring.kafka.bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:29092}
+spring.kafka.consumer.group-id: ${KAFKA_CONSUMER_GROUP:shipping-service}
+spring.kafka.consumer.auto-offset-reset: earliest
+app.kafka.order-events-topic: ${KAFKA_ORDER_EVENTS_TOPIC:boutique.order.events}
+app.kafka.shipping-events-topic: ${KAFKA_SHIPPING_EVENTS_TOPIC:boutique.shipping.events}

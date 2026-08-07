@@ -1,0 +1,2 @@
+package com.boutique.shipping.repository;import com.boutique.shipping.entity.ShippingOutboxEvent;import org.springframework.data.jpa.repository.*;import org.springframework.data.repository.query.Param;import java.util.*;
+public interface ShippingOutboxRepository extends JpaRepository<ShippingOutboxEvent,UUID>{@Query(value="select * from shipping_outbox_events where kafka_published_at is null or rabbit_published_at is null order by created_at limit :limit for update skip locked",nativeQuery=true)List<ShippingOutboxEvent>lockBatch(@Param("limit")int limit);}
