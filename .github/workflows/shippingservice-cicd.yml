@@ -2,22 +2,26 @@ name: Shipping Service CI/CD
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
+
   pull_request:
-    branches: [main]
+    branches:
+      - main
+
   workflow_dispatch:
 
-# Required for repository access and GitHub OIDC authentication to AWS
+# Required for checkout and GitHub OIDC authentication to AWS
 permissions:
   contents: read
   id-token: write
 
-# Prevent multiple deployments of the same branch from colliding
+# Do not allow two Shipping deployments on the same branch at once
 concurrency:
   group: shippingservice-${{ github.ref }}
   cancel-in-progress: false
 
-# Common Shipping Service, AWS, Kubernetes, Helm and Sonar settings
+# Common Shipping Service configuration
 env:
   SERVICE_NAME: shippingservice
 
@@ -42,11 +46,12 @@ env:
 
 jobs:
 
-  # PR validates code and quality only; nothing is deployed
+  # Pull requests run tests and Sonar only
   pr-validation:
     if: github.event_name == 'pull_request'
+
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
 
     steps:
       - name: Checkout source
@@ -54,7 +59,6 @@ jobs:
         with:
           fetch-depth: 0
 
-      # Java 21 with Maven dependency caching
       - name: Setup Java 21
         uses: actions/setup-java@v4
         with:
@@ -62,13 +66,12 @@ jobs:
           java-version: "21"
           cache: maven
 
-      # Fix Windows line endings and allow Maven wrapper execution
+      # Fix Windows line endings and Maven wrapper permissions
       - name: Prepare Maven wrapper
         run: |
           sed -i 's/\r$//' mvnw
           chmod +x mvnw
 
-      # Run Shipping Service tests using Nexus
       - name: Run tests
         env:
           NEXUS_USERNAME: ${{ secrets.NEXUS_USERNAME }}
@@ -80,8 +83,7 @@ jobs:
             -s .mvn/nexus-settings.xml \
             clean test
 
-      # Send code-quality analysis to SonarQube
-      - name: SonarQube analysis
+      - name: Run SonarQube analysis
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
           NEXUS_USERNAME: ${{ secrets.NEXUS_USERNAME }}
@@ -98,7 +100,7 @@ jobs:
             -Dsonar.token="$SONAR_TOKEN"
 
 
-  # Main pipeline: JAR → Nexus → Docker → ECR → Helm → EKS
+  # Main pipeline: Maven → Sonar → Nexus → ECR → Helm → EKS
   deploy-main:
     if: >-
       github.ref == 'refs/heads/main' &&
@@ -106,10 +108,10 @@ jobs:
        github.event_name == 'workflow_dispatch')
 
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 35
 
     steps:
-      - name: Checkout source
+      - name: Checkout Shipping Service
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -126,7 +128,7 @@ jobs:
           sed -i 's/\r$//' mvnw
           chmod +x mvnw
 
-      # One immutable version is reused across JAR, ECR and Helm
+      # Same immutable version is used by Nexus, ECR, Helm and EKS
       - name: Generate application version
         run: |
           APP_VERSION="1.0.${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT}"
@@ -134,9 +136,9 @@ jobs:
           echo "APP_VERSION=$APP_VERSION" >> "$GITHUB_ENV"
           echo "JAR_NAME=shippingservice-$APP_VERSION.jar" >> "$GITHUB_ENV"
 
-          echo "Shipping version: $APP_VERSION"
+          echo "Application version: $APP_VERSION"
 
-      # Fail early when a required GitHub secret is missing
+      # Fail early if an important GitHub secret is missing
       - name: Validate required secrets
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
@@ -156,9 +158,7 @@ jobs:
             fi
           done
 
-          echo "Required secrets verified"
-
-      # Apply the CI-generated version to Maven
+      # Apply the generated CI version to Maven
       - name: Set Maven version
         run: |
           ./mvnw \
@@ -168,8 +168,8 @@ jobs:
             -DnewVersion="$APP_VERSION" \
             -DgenerateBackupPoms=false
 
-      # Test and create the versioned Shipping Service JAR
-      - name: Build JAR
+      # Test and create the versioned Shipping JAR
+      - name: Test and build JAR
         env:
           NEXUS_USERNAME: ${{ secrets.NEXUS_USERNAME }}
           NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
@@ -184,8 +184,8 @@ jobs:
 
           echo "JAR created: $JAR_NAME"
 
-      # Analyze the exact application version being deployed
-      - name: SonarQube analysis
+      # Analyze the exact version that will be deployed
+      - name: Run SonarQube analysis
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
           NEXUS_USERNAME: ${{ secrets.NEXUS_USERNAME }}
@@ -202,7 +202,7 @@ jobs:
             -Dsonar.host.url="$SONAR_HOST_URL" \
             -Dsonar.token="$SONAR_TOKEN"
 
-      # Store the versioned JAR in Nexus
+      # Publish the versioned JAR to Nexus
       - name: Publish JAR to Nexus
         env:
           NEXUS_USERNAME: ${{ secrets.NEXUS_USERNAME }}
@@ -215,7 +215,7 @@ jobs:
             deploy \
             -DskipTests
 
-      # GitHub OIDC assumes the AWS deployment role
+      # Authenticate GitHub to AWS using OIDC
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v6.2.3
         with:
@@ -224,28 +224,29 @@ jobs:
           role-session-name: shippingservice-${{ github.run_id }}
           allowed-account-ids: "663130434910"
 
-      # Verify the expected AWS account and ECR repository
+      # Verify that the workflow is using the expected AWS account and ECR repo
       - name: Validate AWS and ECR
         run: |
           ACCOUNT="$(aws sts get-caller-identity \
             --query Account \
             --output text)"
 
-          test "$ACCOUNT" = "$AWS_ACCOUNT_ID"
+          if [ "$ACCOUNT" != "$AWS_ACCOUNT_ID" ]; then
+            echo "Expected AWS account: $AWS_ACCOUNT_ID"
+            echo "Actual AWS account  : $ACCOUNT"
+            exit 1
+          fi
 
           aws ecr describe-repositories \
             --repository-names "$ECR_REPOSITORY" \
             --region "$AWS_REGION" \
             > /dev/null
 
-          echo "AWS and ECR verified"
-
-      # Authenticate Docker to Amazon ECR
-      - name: Login to ECR
+      - name: Login to Amazon ECR
         id: ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      # Build the immutable Shipping Service container image
+      # Build the Shipping image with the same application version
       - name: Build Docker image
         env:
           ECR_REGISTRY: ${{ steps.ecr.outputs.registry }}
@@ -262,14 +263,13 @@ jobs:
             -t "$IMAGE_URI" \
             .
 
-      # Trivy is temporarily disabled until the scan/cache issue is fixed
+      # Trivy remains disabled until the existing scan/cache issue is fixed
 
-      # Push the immutable image to ECR
       - name: Push image to ECR
         run: |
           docker push "$IMAGE_URI"
 
-      # Confirm the pushed image exists and capture its digest
+      # Verify the pushed image and capture its immutable digest
       - name: Validate ECR image
         run: |
           IMAGE_DIGEST="$(aws ecr describe-images \
@@ -279,8 +279,10 @@ jobs:
             --query 'imageDetails[0].imageDigest' \
             --output text)"
 
-          test -n "$IMAGE_DIGEST"
-          test "$IMAGE_DIGEST" != "None"
+          if [ -z "$IMAGE_DIGEST" ] || [ "$IMAGE_DIGEST" = "None" ]; then
+            echo "Shipping image was not found in ECR"
+            exit 1
+          fi
 
           echo "IMAGE_DIGEST=$IMAGE_DIGEST" >> "$GITHUB_ENV"
 
@@ -290,7 +292,7 @@ jobs:
       - name: Setup Helm
         uses: azure/setup-helm@v5.0.0
 
-      # Get the central Shipping Service Helm chart
+      # Checkout the central Helm repository used by all services
       - name: Checkout platform repository
         uses: actions/checkout@v4
         with:
@@ -298,20 +300,20 @@ jobs:
           path: boutique-platform-infra
           persist-credentials: false
 
-      # Catch Helm syntax/rendering errors before touching EKS
+      # Catch chart/template problems before connecting the release to EKS
       - name: Validate Helm chart
         run: |
           helm lint "$HELM_CHART_PATH"
 
-          helm template "$HELM_RELEASE" "$HELM_CHART_PATH" \
+          helm template \
+            "$HELM_RELEASE" \
+            "$HELM_CHART_PATH" \
             --namespace "$K8S_NAMESPACE" \
             --set image.repository="$IMAGE_REPOSITORY" \
             --set image.tag="$APP_VERSION" \
-            > /tmp/shippingservice.yaml
+            > /dev/null
 
-          test -s /tmp/shippingservice.yaml
-
-      # Connect kubectl to the Boutique EKS cluster
+      # Configure kubectl for the Boutique EKS cluster
       - name: Configure EKS access
         run: |
           aws eks update-kubeconfig \
@@ -326,7 +328,7 @@ jobs:
             -n "$K8S_NAMESPACE")" = "yes"
 
       # Shipping requires PostgreSQL credentials, Kafka and RabbitMQ
-      - name: Validate runtime dependencies
+      - name: Validate Shipping dependencies
         run: |
           kubectl get svc kafka \
             -n "$K8S_NAMESPACE" \
@@ -350,7 +352,7 @@ jobs:
 
           echo "Shipping dependencies verified"
 
-      # Stop deployment if another Helm operation is unfinished
+      # Refuse deployment while a previous Helm operation is unfinished
       - name: Check Helm release state
         run: |
           STATUS="$(helm status "$HELM_RELEASE" \
@@ -367,8 +369,8 @@ jobs:
               ;;
           esac
 
-      # Helm is the deployment source of truth for Shipping Service
-      - name: Deploy with Helm
+      # Deploy the exact ECR image through the central Shipping Helm chart
+      - name: Deploy Shipping Service with Helm
         run: |
           helm upgrade --install \
             "$HELM_RELEASE" \
@@ -382,53 +384,104 @@ jobs:
             --wait \
             --timeout 5m
 
-      # Wait until the new Shipping pods become Ready
-      - name: Validate rollout
+      # Confirm Kubernetes successfully completed the new rollout
+      - name: Validate Kubernetes rollout
         run: |
           kubectl rollout status \
             deployment/"$K8S_DEPLOYMENT" \
             -n "$K8S_NAMESPACE" \
             --timeout=180s
 
-      # Confirm EKS is running the exact image built by this workflow
-      - name: Validate deployed image
+      # Verify EKS is running the exact image produced by this workflow
+      - name: Validate deployed image and replicas
         run: |
           DEPLOYED_IMAGE="$(kubectl get deployment "$K8S_DEPLOYMENT" \
             -n "$K8S_NAMESPACE" \
             -o jsonpath='{.spec.template.spec.containers[0].image}')"
 
+          READY="$(kubectl get deployment "$K8S_DEPLOYMENT" \
+            -n "$K8S_NAMESPACE" \
+            -o jsonpath='{.status.readyReplicas}')"
+
+          DESIRED="$(kubectl get deployment "$K8S_DEPLOYMENT" \
+            -n "$K8S_NAMESPACE" \
+            -o jsonpath='{.spec.replicas}')"
+
           if [ "$DEPLOYED_IMAGE" != "$IMAGE_URI" ]; then
-            echo "Expected: $IMAGE_URI"
-            echo "Running : $DEPLOYED_IMAGE"
+            echo "Expected image: $IMAGE_URI"
+            echo "Running image : $DEPLOYED_IMAGE"
             exit 1
           fi
 
-          echo "Deployed image verified"
+          if [ "${READY:-0}" != "$DESIRED" ]; then
+            echo "Ready replicas: ${READY:-0}/${DESIRED}"
+            exit 1
+          fi
 
-      # Call Spring Boot actuator from inside the Shipping pod
-      - name: Validate application health
+          echo "Image verified: $DEPLOYED_IMAGE"
+          echo "Ready replicas: $READY/$DESIRED"
+
+      # Test the Kubernetes Service and Spring Boot health endpoint
+      - name: Validate Shipping Service health
         run: |
-          POD="$(kubectl get pods \
+          ENDPOINTS="$(kubectl get endpointslice \
             -n "$K8S_NAMESPACE" \
-            -l app="$SERVICE_NAME" \
-            --field-selector=status.phase=Running \
-            -o jsonpath='{.items[0].metadata.name}')"
+            -l kubernetes.io/service-name="$K8S_SERVICE" \
+            -o jsonpath='{range .items[*].endpoints[*]}{.addresses[0]}{" "}{end}')"
 
-          test -n "$POD"
+          if [ -z "$ENDPOINTS" ]; then
+            echo "Shipping Service has no ready endpoints"
+            exit 1
+          fi
 
-          kubectl exec \
+          TEST_POD="shipping-health-${GITHUB_RUN_ID}"
+
+          cleanup() {
+            kubectl delete pod "$TEST_POD" \
+              -n "$K8S_NAMESPACE" \
+              --ignore-not-found \
+              > /dev/null 2>&1 || true
+          }
+
+          trap cleanup EXIT
+
+          kubectl run "$TEST_POD" \
             -n "$K8S_NAMESPACE" \
-            "$POD" \
-            -- wget -qO- \
-            "http://127.0.0.1:${SERVICE_PORT}/actuator/health" \
-            | grep -q '"status":"UP"'
+            --restart=Never \
+            --image=curlimages/curl \
+            --command -- \
+            curl \
+              --fail \
+              --silent \
+              --show-error \
+              --retry 5 \
+              --retry-delay 3 \
+              "http://${K8S_SERVICE}:${SERVICE_PORT}/actuator/health" \
+            > /dev/null
+
+          kubectl wait \
+            --for=jsonpath='{.status.phase}'=Succeeded \
+            pod/"$TEST_POD" \
+            -n "$K8S_NAMESPACE" \
+            --timeout=90s \
+            > /dev/null
+
+          HEALTH="$(kubectl logs "$TEST_POD" \
+            -n "$K8S_NAMESPACE")"
+
+          echo "$HEALTH"
+
+          if ! echo "$HEALTH" | grep -q '"status":"UP"'; then
+            echo "Shipping Service health check failed"
+            exit 1
+          fi
 
           echo "Shipping Service health: UP"
 
-      # Final traceability of what was deployed
+      # Show only the important deployment identities
       - name: Deployment summary
         run: |
-          echo "Shipping Service deployed successfully"
+          echo "Shipping Service deployment completed"
           echo "Version : $APP_VERSION"
           echo "JAR     : $JAR_NAME"
           echo "Image   : $IMAGE_URI"
